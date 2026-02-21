@@ -1,10 +1,13 @@
 from pydantic import BaseModel
 from typing import List, Optional
+from datetime import datetime
+from uuid import UUID
 
 
 class AskRequest(BaseModel):
     question: str
     document_ids: Optional[List[str]] = None
+    conversation_id: Optional[UUID] = None
 
 
 class SourceCitation(BaseModel):
@@ -29,3 +32,24 @@ class AskResponse(BaseModel):
     answer: str
     sources: List[SourceCitation]
     retrieval_metadata: RetrievalMetadata
+    conversation_id: UUID
+    message_id: UUID
+
+
+class ChatMessage(BaseModel):
+    id: UUID
+    conversation_id: UUID
+    role: str
+    content: str
+    sources: Optional[List[SourceCitation]] = None
+    metadata: Optional[dict] = None
+    created_at: datetime
+
+
+class Conversation(BaseModel):
+    id: UUID
+    user_id: UUID
+    title: str
+    created_at: datetime
+    updated_at: datetime
+

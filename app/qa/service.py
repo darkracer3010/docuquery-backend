@@ -1,13 +1,21 @@
 import json
 import logging
-from typing import List, Optional
+from typing import AsyncIterator, List, Optional
+from datetime import datetime
+from uuid import UUID, uuid4
 
 from openai import OpenAI
 from supabase import Client
 
 from app.config import get_settings
 from app.embeddings.service import EmbeddingService
-from app.qa.schemas import SourceCitation, RetrievalMetadata, AskResponse
+from app.qa.schemas import (
+    SourceCitation, 
+    RetrievalMetadata, 
+    AskResponse, 
+    ChatMessage, 
+    Conversation
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +71,10 @@ class QAService:
         )
 
         if not candidates:
+            # No document context found — respond as a general assistant
+            general_answer = self._general_chat(question)
             return AskResponse(
-                answer="I couldn't find any relevant information in your documents to answer this question. Please make sure you've uploaded relevant documents and they have been processed successfully.",
+                answer=general_answer,
                 sources=[],
                 retrieval_metadata=RetrievalMetadata(
                     total_candidates=0,
@@ -93,6 +103,11 @@ class QAService:
         )
 
         # Step 7: Cache & log
+        # For synchronous ask, we just use a default or dummy conversation ID for now
+        dummy_conv_id = uuid4()
+        response.conversation_id = dummy_conv_id
+        response.message_id = uuid4()
+
         self._cache_response(question, query_embedding, user_id, document_ids, response)
         self._log_query(question, user_id)
 
@@ -211,7 +226,7 @@ Return ONLY valid JSON array, no other text:
     ) -> tuple[str, List[SourceCitation]]:
         """Generate an answer using the re-ranked chunks as context."""
         if not chunks:
-            return "No relevant information found.", []
+            return self._general_chat(question), []
 
         # Build context
         context_parts = []
@@ -266,6 +281,304 @@ Provide a comprehensive answer with source citations [1], [2], etc."""
 
         return answer, sources
 
+    # ── General Chat (No RAG) ─────────────────────────────────────
+
+    def _general_chat(self, question: str) -> str:
+        """Handle general conversation without document context."""
+        try:
+            response = self.openai.chat.completions.create(
+                model=self.settings.chat_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are DocuQuery, a helpful AI assistant for document intelligence. "
+                            "You can answer general questions, have normal conversations, and help users "
+                            "with their uploaded documents. If the user asks about specific document content "
+                            "but no documents were found, let them know they can upload documents and ask "
+                            "questions about them. Be friendly and concise."
+                        ),
+                    },
+                    {"role": "user", "content": question},
+                ],
+                temperature=0.7,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"General chat failed: {e}")
+            return "Sorry, I'm having trouble responding right now. Please try again."
+
+    # ── Streaming Pipeline ────────────────────────────────────────
+
+    _GENERAL_SYSTEM_PROMPT = (
+        "You are DocuQuery, a helpful AI assistant for document intelligence. "
+        "You can answer general questions, have normal conversations, and help users "
+        "with their uploaded documents. If the user asks about specific document content "
+        "but no documents were found, let them know they can upload documents and ask "
+        "questions about them. Be friendly and concise."
+    )
+
+    _RAG_SYSTEM_PROMPT = """You are a helpful document Q&A assistant. Answer the user's question based ONLY on the provided document context.
+
+RULES:
+1. Use ONLY information from the provided sources to answer
+2. Cite your sources using [1], [2], etc. markers corresponding to the source numbers
+3. If the context doesn't contain enough information, say so clearly
+4. Be accurate and concise
+5. Do not fabricate information not present in the sources"""
+
+    async def ask_stream(
+        self,
+        question: str,
+        user_id: str,
+        document_ids: Optional[List[str]] = None,
+        conversation_id: Optional[UUID] = None,
+    ) -> AsyncIterator[str]:
+        """
+          event: done\ndata: {}\n\n
+        """
+        # Step 0: Ensure conversation exists and log user message
+        conv_id = await self._get_or_create_conversation(user_id, conversation_id, question)
+        user_msg_id = await self._save_message(conv_id, "user", question)
+
+        # Fast path: skip RAG for clearly general queries
+        if not document_ids and self._is_general_query(question):
+            full_answer = ""
+            async for event in self._stream_llm(question, self._GENERAL_SYSTEM_PROMPT):
+                yield event
+                if event.startswith("event: token\n"):
+                    data_line = event.split("data: ", 1)[1].split("\n")[0]
+                    full_answer += json.loads(data_line)
+
+            metadata = RetrievalMetadata(
+                total_candidates=0, after_reranking=0,
+                model_used=self.settings.chat_model, cache_hit=False,
+            )
+            yield f"event: sources\ndata: []\n\n"
+            
+            # Save and yield metadata
+            assistant_msg_id = await self._save_message(
+                conv_id, "assistant", full_answer, [], metadata.model_dump()
+            )
+            
+            meta_json = metadata.model_dump()
+            meta_json["conversation_id"] = str(conv_id)
+            meta_json["message_id"] = str(assistant_msg_id)
+            
+            yield f"event: metadata\ndata: {json.dumps(meta_json)}\n\n"
+            yield "event: done\ndata: {}\n\n"
+            return
+
+        # Step 1: Embed the question
+        query_embedding = self.embedding_service.embed_single(question)
+
+        # Step 2: Check semantic cache
+        cached = self._check_cache(query_embedding, user_id)
+        if cached:
+            self.admin.table("query_cache").update(
+                {"hit_count": cached["hit_count"] + 1}
+            ).eq("id", cached["id"]).execute()
+
+            response_data = cached["response"]
+            # Stream the cached answer token-by-token for consistent UX
+            answer = response_data.get("answer", "")
+            for word in answer.split(" "):
+                yield f"event: token\ndata: {json.dumps(word + ' ')}\n\n"
+
+            sources = response_data.get("sources", [])
+            metadata_dict = response_data.get("retrieval_metadata", {})
+            metadata_dict["cache_hit"] = True
+            
+            # Save cached response as a new message in history
+            assistant_msg_id = await self._save_message(
+                conv_id, "assistant", answer, sources, metadata_dict
+            )
+            
+            metadata_dict["conversation_id"] = str(conv_id)
+            metadata_dict["message_id"] = str(assistant_msg_id)
+
+            yield f"event: sources\ndata: {json.dumps(sources)}\n\n"
+            yield f"event: metadata\ndata: {json.dumps(metadata_dict)}\n\n"
+            yield "event: done\ndata: {}\n\n"
+            return
+
+        # Step 3: Retrieve candidates
+        candidates = self._vector_search(
+            query_embedding, user_id, document_ids, self.settings.retrieval_top_k
+        )
+
+        if not candidates:
+            # General chat — stream directly
+            full_answer = ""
+            async for event in self._stream_llm(question, self._GENERAL_SYSTEM_PROMPT):
+                yield event
+                if event.startswith("event: token\n"):
+                    data_line = event.split("data: ", 1)[1].split("\n")[0]
+                    full_answer += json.loads(data_line)
+
+            metadata = RetrievalMetadata(
+                total_candidates=0, after_reranking=0,
+                model_used=self.settings.chat_model, cache_hit=False,
+            )
+            yield f"event: sources\ndata: []\n\n"
+            
+            assistant_msg_id = await self._save_message(
+                conv_id, "assistant", full_answer, [], metadata.model_dump()
+            )
+            
+            meta_json = metadata.model_dump()
+            meta_json["conversation_id"] = str(conv_id)
+            meta_json["message_id"] = str(assistant_msg_id)
+
+            yield f"event: metadata\ndata: {json.dumps(meta_json)}\n\n"
+            yield "event: done\ndata: {}\n\n"
+            return
+
+        # Step 4: Re-rank
+        reranked = self._rerank_chunks(question, candidates)
+
+        if not reranked:
+            # Re-ranking filtered everything — fall back to general chat
+            full_answer = ""
+            async for event in self._stream_llm(question, self._GENERAL_SYSTEM_PROMPT):
+                yield event
+                if event.startswith("event: token\n"):
+                    data_line = event.split("data: ", 1)[1].split("\n")[0]
+                    full_answer += json.loads(data_line)
+
+            metadata = RetrievalMetadata(
+                total_candidates=len(candidates), after_reranking=0,
+                model_used=self.settings.chat_model, cache_hit=False,
+            )
+            yield f"event: sources\ndata: []\n\n"
+            
+            assistant_msg_id = await self._save_message(
+                conv_id, "assistant", full_answer, [], metadata.model_dump()
+            )
+            
+            meta_json = metadata.model_dump()
+            meta_json["conversation_id"] = str(conv_id)
+            meta_json["message_id"] = str(assistant_msg_id)
+
+            yield f"event: metadata\ndata: {json.dumps(meta_json)}\n\n"
+            yield "event: done\ndata: {}\n\n"
+            return
+
+        # Step 5: Build context and stream the RAG answer
+        context_parts = []
+        for i, chunk in enumerate(reranked):
+            source_info = f"[Source {i + 1}] Document: {chunk.get('file_name', 'Unknown')}, Page: {chunk.get('page_number', 'N/A')}"
+            context_parts.append(f"{source_info}\n{chunk['content']}")
+        context = "\n\n---\n\n".join(context_parts)
+
+        user_prompt = f"CONTEXT:\n{context}\n\nQUESTION: {question}\n\nProvide a comprehensive answer with source citations [1], [2], etc."
+
+        full_answer = ""
+        async for event in self._stream_llm(user_prompt, self._RAG_SYSTEM_PROMPT, temperature=0.1):
+            yield event
+            # Extract the token text from the event to accumulate the full answer
+            if event.startswith("event: token\n"):
+                data_line = event.split("data: ", 1)[1].split("\n")[0]
+                full_answer += json.loads(data_line)
+
+        # Build source citations
+        sources = []
+        for i, chunk in enumerate(reranked):
+            sources.append(
+                SourceCitation(
+                    citation_index=i + 1,
+                    document_name=chunk.get("file_name", "Unknown"),
+                    document_id=str(chunk.get("document_id", "")),
+                    page_number=chunk.get("page_number"),
+                    chunk_snippet=chunk["content"][:200] + "..." if len(chunk["content"]) > 200 else chunk["content"],
+                    vector_similarity_score=round(float(chunk.get("similarity", 0)), 4),
+                    relevance_score=round(float(chunk.get("relevance_score", 0)), 4),
+                    relevance_justification=chunk.get("relevance_justification", ""),
+                ).model_dump()
+            )
+
+        metadata = RetrievalMetadata(
+            total_candidates=len(candidates),
+            after_reranking=len(reranked),
+            model_used=self.settings.chat_model,
+            cache_hit=False,
+        )
+
+        yield f"event: sources\ndata: {json.dumps(sources)}\n\n"
+        
+        # Step 6: Save assistant message and update cache
+        assistant_msg_id = await self._save_message(
+            conv_id, 
+            "assistant", 
+            full_answer, 
+            sources, 
+            metadata.model_dump()
+        )
+        
+        meta_json = metadata.model_dump()
+        meta_json["conversation_id"] = str(conv_id)
+        meta_json["message_id"] = str(assistant_msg_id)
+
+        yield f"event: metadata\ndata: {json.dumps(meta_json)}\n\n"
+        yield "event: done\ndata: {}\n\n"
+
+        # Update semantic cache
+        try:
+            response = AskResponse(
+                answer=full_answer,
+                sources=[SourceCitation(**s) for s in sources],
+                retrieval_metadata=metadata,
+                conversation_id=conv_id,
+                message_id=assistant_msg_id
+            )
+            self._cache_response(question, query_embedding, user_id, document_ids, response)
+        except Exception as e:
+            logger.warning(f"Post-stream history/cache failed: {e}")
+
+    def _is_general_query(self, question: str) -> bool:
+        """Heuristic to detect if a query is general conversation vs document-specific."""
+        q = question.lower().strip()
+        
+        # Very short queries are likely general
+        if len(q.split()) < 3:
+            return True
+            
+        # Common greetings/general intents
+        general_keywords = {
+            "hi", "hello", "hey", "how are you", "who are you", 
+            "what can you do", "help", "thanks", "thank you",
+            "tell me a joke", "joke", "weather", "good morning",
+            "good afternoon", "good evening"
+        }
+        
+        # Check if query starts with or is a general greeting
+        if any(q.startswith(kw) for kw in general_keywords):
+            return True
+            
+        return False
+
+    async def _stream_llm(
+        self, user_content: str, system_prompt: str, temperature: float = 0.7
+    ) -> AsyncIterator[str]:
+        """Stream OpenAI completion token-by-token as SSE events."""
+        try:
+            stream = self.openai.chat.completions.create(
+                model=self.settings.chat_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=temperature,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    yield f"event: token\ndata: {json.dumps(delta.content)}\n\n"
+        except Exception as e:
+            logger.error(f"Streaming LLM failed: {e}")
+            yield f"event: token\ndata: {json.dumps('Sorry, I encountered an error. Please try again.')}\n\n"
+
     # ── Semantic Cache ─────────────────────────────────────────────
 
     def _check_cache(self, query_embedding: List[float], user_id: str) -> Optional[dict]:
@@ -280,8 +593,11 @@ Provide a comprehensive answer with source citations [1], [2], etc."""
                 },
             ).execute()
 
-            if result.data:
-                return result.data[0]
+            if result.data and isinstance(result.data, list) and len(result.data) > 0:
+                entry = result.data[0]
+                # Validate the expected keys exist
+                if isinstance(entry, dict) and "hit_count" in entry and "response" in entry:
+                    return entry
             return None
         except Exception as e:
             logger.warning(f"Cache check failed: {e}")
@@ -311,6 +627,83 @@ Provide a comprehensive answer with source citations [1], [2], etc."""
             logger.warning(f"Failed to cache response: {e}")
 
     # ── Query Logging ──────────────────────────────────────────────
+
+    # ── Conversation History ──────────────────────────────────────
+
+    async def get_conversations(self, user_id: str) -> List[Conversation]:
+        """Fetch all conversations for a user, sorted by recency."""
+        try:
+            result = self.admin.table("conversations").select("*").eq("user_id", user_id).order("updated_at", desc=True).execute()
+            return [Conversation(**c) for c in result.data]
+        except Exception as e:
+            logger.error(f"Failed to fetch conversations: {e}")
+            return []
+
+    async def get_messages(self, conversation_id: str, user_id: str) -> List[ChatMessage]:
+        """Fetch all messages for a specific conversation."""
+        # Verify ownership via query (RLS should handle this, but let's be explicit if needed)
+        try:
+            result = self.admin.table("messages").select("*").eq("conversation_id", conversation_id).order("created_at").execute()
+            return [ChatMessage(**m) for m in result.data]
+        except Exception as e:
+            logger.error(f"Failed to fetch messages: {e}")
+            return []
+
+    async def delete_conversation(self, conversation_id: str, user_id: str) -> bool:
+        """Delete a conversation and its messages."""
+        try:
+            self.admin.table("conversations").delete().eq("id", conversation_id).eq("user_id", user_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete conversation: {e}")
+            return False
+
+    async def _get_or_create_conversation(
+        self, user_id: str, conversation_id: Optional[UUID], first_message: str
+    ) -> UUID:
+        """Get existing conversation or create a new one with a snippet of the first message as title."""
+        if conversation_id:
+            return conversation_id
+
+        # Create new conversation
+        title = (first_message[:40] + "...") if len(first_message) > 40 else first_message
+        try:
+            result = self.admin.table("conversations").insert({
+                "user_id": user_id,
+                "title": title
+            }).execute()
+            return UUID(result.data[0]["id"])
+        except Exception as e:
+            logger.error(f"Failed to create conversation: {e}")
+            return uuid4() # Fallback to avoid breaking the stream
+
+    async def _save_message(
+        self, 
+        conversation_id: UUID, 
+        role: str, 
+        content: str, 
+        sources: List[dict] = None, 
+        metadata: dict = None
+    ) -> UUID:
+        """Save a message to the database and update conversation timestamp."""
+        try:
+            result = self.admin.table("messages").insert({
+                "conversation_id": str(conversation_id),
+                "role": role,
+                "content": content,
+                "sources": sources or [],
+                "metadata": metadata or {}
+            }).execute()
+            
+            # Update conversation timestamp
+            self.admin.table("conversations").update({
+                "updated_at": datetime.now().isoformat()
+            }).eq("id", str(conversation_id)).execute()
+            
+            return UUID(result.data[0]["id"])
+        except Exception as e:
+            logger.error(f"Failed to save message: {e}")
+            return uuid4()
 
     def _log_query(self, question: str, user_id: str):
         """Log the query for analytics."""

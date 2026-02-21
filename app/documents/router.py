@@ -4,7 +4,7 @@ from typing import List
 from app.auth.dependencies import get_current_user
 from app.dependencies import get_supabase_client, get_supabase_admin_client, get_openai_client
 from app.documents.service import DocumentService
-from app.documents.schemas import DocumentUploadResponse, DocumentResponse, DocumentListResponse
+from app.documents.schemas import DocumentUploadResponse, DocumentResponse, DocumentListResponse, DocumentProgressResponse
 from app.embeddings.service import EmbeddingService
 
 router = APIRouter()
@@ -96,6 +96,26 @@ async def list_documents(user_id: str = Depends(get_current_user)):
     return DocumentListResponse(
         documents=[DocumentResponse(**d) for d in docs],
         total=len(docs),
+    )
+
+
+@router.get("/{document_id}/progress", response_model=DocumentProgressResponse)
+async def get_document_progress(
+    document_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    """Get granular processing progress for a document."""
+    service = _get_document_service()
+    doc = service.get_document(document_id, user_id)
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found",
+        )
+    return DocumentProgressResponse(
+        id=doc["id"],
+        status=doc["status"],
+        indexing_progress=doc["indexing_progress"]
     )
 
 

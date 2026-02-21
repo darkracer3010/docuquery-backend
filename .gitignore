@@ -13,6 +13,7 @@ build/
 *.egg
 uv.lock
 runtime.txt
+backend.log
 
 # Virtual environment
 venv/

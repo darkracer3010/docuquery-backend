@@ -30,3 +30,9 @@ class DocumentResponse(BaseModel):
 class DocumentListResponse(BaseModel):
     documents: list[DocumentResponse]
     total: int
+
+
+class DocumentProgressResponse(BaseModel):
+    id: str
+    status: str
+    indexing_progress: int

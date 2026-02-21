@@ -19,8 +19,10 @@ class AuthService:
             )
 
             if response.user:
-                # Create profile row
-                self.client.table("profiles").insert(
+                # Create profile row using admin client to bypass RLS
+                from app.dependencies import get_supabase_admin_client
+                admin_client = get_supabase_admin_client()
+                admin_client.table("profiles").insert(
                     {
                         "id": response.user.id,
                         "full_name": full_name,
