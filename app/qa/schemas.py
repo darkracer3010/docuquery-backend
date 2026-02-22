@@ -6,7 +6,6 @@ from uuid import UUID
 
 class AskRequest(BaseModel):
     question: str
-    document_ids: Optional[List[str]] = None
     conversation_id: Optional[UUID] = None
 
 

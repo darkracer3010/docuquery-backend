@@ -46,7 +46,7 @@ async def ask_question(
         result = await service.ask(
             question=body.question,
             user_id=user_id,
-            document_ids=body.document_ids,
+            document_ids=None,  # Always query all documents
         )
         return result
     except Exception as e:
@@ -74,7 +74,7 @@ async def ask_question_stream(
         service.ask_stream(
             question=body.question,
             user_id=user_id,
-            document_ids=body.document_ids,
+            document_ids=None,  # Always query all documents
             conversation_id=body.conversation_id,
         ),
         media_type="text/event-stream",
