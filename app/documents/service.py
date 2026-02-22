@@ -266,7 +266,7 @@ class DocumentService:
         return result.data[0] if result.data else None
 
     def delete_document(self, document_id: str, user_id: str) -> bool:
-        """Delete a document, its chunks, and its storage file."""
+        """Delete a document, its chunks, its storage file, and invalidate related cache entries."""
         doc = self.get_document(document_id, user_id)
         if not doc:
             return False
@@ -281,6 +281,27 @@ class DocumentService:
         self.admin.table("chunks").delete().eq(
             "document_id", document_id
         ).execute()
+
+        # Invalidate cache entries that reference this document
+        try:
+            # Use RPC function to delete only cache entries that reference this document
+            result = self.admin.rpc(
+                "delete_cache_for_document",
+                {
+                    "target_document_id": document_id,
+                    "target_user_id": user_id
+                }
+            ).execute()
+            deleted_count = result.data if result.data else 0
+            logger.info(f"Cleared {deleted_count} cache entries for document {document_id}")
+        except Exception as e:
+            # Fallback: delete all user cache if RPC function doesn't exist
+            logger.warning(f"RPC function not available, clearing all user cache: {e}")
+            try:
+                self.admin.table("query_cache").delete().eq("user_id", user_id).execute()
+                logger.info(f"Cleared all query cache for user {user_id}")
+            except Exception as e2:
+                logger.warning(f"Failed to clear query cache: {e2}")
 
         # Delete document record
         self.admin.table("documents").delete().eq("id", document_id).execute()
