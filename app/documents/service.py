@@ -102,18 +102,18 @@ class DocumentService:
                 return
             self._update_status(document_id, "processing", 30)
 
-            # 3. Choose chunker (default to semantic, but ready for LLM)
+            # 3. Choose chunker based on settings
             if not self._document_exists(document_id):
                 return
-            # You can toggle this via settings or document metadata in future
-            use_llm_chunking = getattr(self.settings, "use_llm_chunking", False)
             
-            if use_llm_chunking:
+            if self.settings.use_llm_chunking:
+                logger.info("Using LLM-based chunking for better accuracy")
                 chunker = LLMChunker(self.openai, self.embedding_service)
                 def chunk_progress(p):
                     self._update_status(document_id, "processing", 30 + int(p * 0.2))
                 chunks = chunker.chunk(elements, on_progress=chunk_progress)
             else:
+                logger.info("Using semantic chunking (default)")
                 chunker = SemanticChunker(self.embedding_service)
                 chunks = chunker.chunk(elements)
 

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     chunk_max_tokens: int = 1200
     chunk_overlap_tokens: int = 200
     semantic_similarity_threshold: float = 0.5
+    use_llm_chunking: bool = False  # Set to True for more accurate LLM-based chunking
 
     # RAG
     retrieval_top_k: int = 10

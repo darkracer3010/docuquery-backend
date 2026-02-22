@@ -62,14 +62,15 @@ class LLMChunker:
             snippet = e.text[:150].replace("\n", " ")
             element_list.append(f"[{j + offset}] (Type: {e.element_type}): {snippet}...")
 
-        prompt = f"""Analyze the following sequence of document elements. 
+        # Use regular string to avoid f-string issues with JSON examples
+        prompt = """Analyze the following sequence of document elements. 
 Identify the indices where a major topic shift occurs (a new section, a change in subject, or a new context).
 
 ELEMENTS:
-{chr(10).join(element_list)}
+{}
 
-Return a JSON object with a key 'boundaries' containing a list of indices where a NEW topic starts. If everything is one topic, return {"boundaries": []}.
-Example: {"boundaries": [5, 12]}"""
+Return a JSON object with a key 'boundaries' containing a list of indices where a NEW topic starts. If everything is one topic, return {{"boundaries": []}}.
+Example: {{"boundaries": [5, 12]}}""".format(chr(10).join(element_list))
 
         try:
             response = self.openai.chat.completions.create(

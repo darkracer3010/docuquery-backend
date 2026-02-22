@@ -352,12 +352,14 @@ RULES:
         conv_id = await self._get_or_create_conversation(user_id, conversation_id, question)
         user_msg_id = await self._save_message(conv_id, "user", question)
 
+        # Load conversation history FIRST (before any caching logic)
         history = []
         if conv_id:
             raw_history = await self.get_messages(str(conv_id), user_id)
-            # Take last 10 messages and format for OpenAI
-            for msg in raw_history[-10:]:
+            # Take last 10 messages (excluding the current user message we just saved)
+            for msg in raw_history[-11:-1]:  # -11:-1 to exclude the last message (current question)
                 history.append({"role": msg.role, "content": msg.content})
+            logger.info(f"Loaded {len(history)} messages from conversation history for context")
 
         # --- GREETING FAST PATH (Moved before caching/embedding) ---
         if self._is_general_query(question):
@@ -391,8 +393,16 @@ RULES:
         query_embedding = self.embedding_service.embed_single(question)
 
         # Step 2: Check semantic cache
+        # We check cache for all questions, but we're smart about when to use it:
+        # - Use cache for identical/very similar questions (similarity > 0.95)
+        # - Skip cache for contextual follow-ups that need conversation history
         cached = self._check_cache(query_embedding, user_id)
-        if cached:
+        
+        # Determine if this is a contextual follow-up question
+        is_contextual_followup = self._is_contextual_question(question) and len(history) > 0
+        
+        if cached and not is_contextual_followup:
+            logger.info(f"Cache hit for question (similarity above threshold)")
             self.admin.table("query_cache").update(
                 {"hit_count": cached["hit_count"] + 1}
             ).eq("id", cached["id"]).execute()
@@ -419,6 +429,10 @@ RULES:
             yield f"event: metadata\ndata: {json.dumps(metadata_dict)}\n\n"
             yield "event: done\ndata: {}\n\n"
             return
+        elif cached and is_contextual_followup:
+            logger.info(f"Cache found but skipping - this is a contextual follow-up question")
+        elif not cached:
+            logger.info(f"No cache hit found")
 
         # Step 3: Retrieve candidates
         candidates = self._vector_search(
@@ -540,7 +554,7 @@ RULES:
         yield f"event: metadata\ndata: {json.dumps(meta_json)}\n\n"
         yield "event: done\ndata: {}\n\n"
 
-        # Update semantic cache (ONLY for RAG results)
+        # Update semantic cache (ONLY for RAG results with sources)
         try:
             response = AskResponse(
                 answer=full_answer,
@@ -549,10 +563,12 @@ RULES:
                 conversation_id=conv_id,
                 message_id=assistant_msg_id
             )
-            if sources: # Extra guard to ensure we only cache if sources were found
+            # Only cache if we have sources (RAG response, not general chat)
+            if sources and len(sources) > 0:
                 self._cache_response(question, query_embedding, user_id, document_ids, response)
+                logger.info(f"Cached RAG response with {len(sources)} sources")
         except Exception as e:
-            logger.warning(f"Post-stream history/cache failed: {e}")
+            logger.warning(f"Post-stream cache failed: {e}")
 
     def _is_general_query(self, question: str) -> bool:
         """Heuristic to detect if a query is general conversation vs document-specific."""
@@ -573,6 +589,32 @@ RULES:
         
         # Check if query starts with or is a general greeting
         if any(q.startswith(kw) for kw in general_keywords):
+            return True
+            
+        return False
+
+    def _is_contextual_question(self, question: str) -> bool:
+        """Detect if a question requires conversational context (references previous messages)."""
+        q = question.lower().strip()
+        
+        # Contextual reference words/phrases
+        contextual_indicators = [
+            "it", "this", "that", "these", "those",
+            "tell me more", "more about", "elaborate", "explain that",
+            "what about", "how about", "and what", "also",
+            "the same", "similar", "like that", "as well",
+            "you mentioned", "you said", "earlier", "before",
+            "continue", "go on", "keep going",
+            "what else", "anything else", "more details"
+        ]
+        
+        # Check if question contains contextual indicators
+        for indicator in contextual_indicators:
+            if indicator in q:
+                return True
+        
+        # Questions starting with "and", "but", "so" are usually contextual
+        if q.startswith(("and ", "but ", "so ", "also ")):
             return True
             
         return False
@@ -632,8 +674,14 @@ RULES:
         document_ids: Optional[List[str]],
         response: AskResponse,
     ):
-        """Store the Q&A result in semantic cache."""
+        """Store the Q&A result in semantic cache. Only cache RAG responses with sources."""
         try:
+            # IMPORTANT: Only cache responses that have sources (RAG results)
+            # Don't cache general conversation as it loses context
+            if not response.sources or len(response.sources) == 0:
+                logger.info("Skipping cache for general conversation (no sources)")
+                return
+                
             self.admin.table("query_cache").insert(
                 {
                     "user_id": user_id,
@@ -644,6 +692,7 @@ RULES:
                     "hit_count": 0,
                 }
             ).execute()
+            logger.info(f"Cached response for question: {question[:50]}...")
         except Exception as e:
             logger.warning(f"Failed to cache response: {e}")
 
@@ -707,6 +756,8 @@ RULES:
         metadata: dict = None
     ) -> UUID:
         """Save a message to the database and update conversation timestamp."""
+        print(f"💾 SAVING MESSAGE: conv={conversation_id}, role={role}")
+        logger.info(f"💾 Saving message: conv={conversation_id}, role={role}")
         try:
             result = self.admin.table("messages").insert({
                 "conversation_id": str(conversation_id),
@@ -721,10 +772,110 @@ RULES:
                 "updated_at": datetime.now().isoformat()
             }).eq("id", str(conversation_id)).execute()
             
+            print(f"📝 MESSAGE SAVED, checking title...")
+            logger.info(f"📝 Message saved, checking if title needs update...")
+            # Check if we should update the conversation title
+            await self._maybe_update_conversation_title(conversation_id)
+            
             return UUID(result.data[0]["id"])
         except Exception as e:
-            logger.error(f"Failed to save message: {e}")
+            print(f"❌ ERROR SAVING MESSAGE: {e}")
+            logger.error(f"Failed to save message: {e}", exc_info=True)
             return uuid4()
+
+    async def _maybe_update_conversation_title(self, conversation_id: UUID):
+        """Update conversation title after 4 messages if it's still the default."""
+        print(f"🔍 Checking title for conversation {conversation_id}")
+        try:
+            # Get conversation
+            conv_result = self.admin.table("conversations").select("*").eq("id", str(conversation_id)).single().execute()
+            if not conv_result.data:
+                print(f"⚠️ Conversation {conversation_id} not found")
+                logger.warning(f"Conversation {conversation_id} not found for title update")
+                return
+            
+            conversation = conv_result.data
+            current_title = conversation.get("title", "")
+            title_generated = conversation.get("title_generated", False)
+            
+            # Get message count
+            messages_result = self.admin.table("messages").select("*").eq("conversation_id", str(conversation_id)).execute()
+            messages = messages_result.data or []
+            
+            print(f"📊 Conversation has {len(messages)} messages, title='{current_title}', title_generated={title_generated}")
+            logger.info(f"Conversation {conversation_id}: {len(messages)} messages, title='{current_title}', title_generated={title_generated}")
+            
+            # If title was already AI-generated, never change it
+            if title_generated:
+                print(f"✅ Title already AI-generated, never changing it")
+                logger.info(f"Title already AI-generated, skipping update")
+                return
+            
+            # Generate title after exactly 4 messages (2 Q&A turns)
+            if len(messages) >= 4:
+                print(f"🎯 Generating title after {len(messages)} messages...")
+                logger.info(f"Generating new title for conversation {conversation_id}")
+                # Generate a smart title from the conversation
+                new_title = await self._generate_conversation_title(messages[:4])  # Use first 2 turns
+                
+                if new_title and new_title != current_title:
+                    self.admin.table("conversations").update({
+                        "title": new_title,
+                        "title_generated": True  # Mark that this title was AI-generated
+                    }).eq("id", str(conversation_id)).execute()
+                    print(f"✅ Updated title to: '{new_title}'")
+                    logger.info(f"✅ Updated conversation title to: '{new_title}'")
+                else:
+                    print(f"⚠️ Failed to generate new title or unchanged")
+                    logger.warning(f"Failed to generate new title or title unchanged")
+            else:
+                print(f"⏳ Not enough messages yet ({len(messages)}/4)")
+                logger.info(f"Not enough messages yet ({len(messages)}/4), keeping current title")
+        except Exception as e:
+            print(f"❌ Error updating title: {e}")
+            logger.error(f"Failed to update conversation title: {e}", exc_info=True)
+
+    async def _generate_conversation_title(self, messages: List[dict]) -> str:
+        """Generate a concise title summarizing the conversation."""
+        try:
+            # Build conversation summary from first 2 turns (4 messages)
+            conversation_text = ""
+            for msg in messages[:4]:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")[:200]  # Truncate long messages
+                conversation_text += f"{role.upper()}: {content}\n"
+            
+            prompt = f"""Based on this conversation, generate a short, descriptive title (max 40 characters).
+The title should capture the main topic or question being discussed.
+
+CONVERSATION:
+{conversation_text}
+
+Return ONLY the title, nothing else. Keep it concise and clear.
+Examples: "Python async patterns", "Resume formatting tips", "SQL query optimization"
+"""
+            
+            response = self.openai.chat.completions.create(
+                model=self.settings.chat_model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that creates concise conversation titles."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=20
+            )
+            
+            title = response.choices[0].message.content.strip()
+            # Remove quotes if present
+            title = title.strip('"\'')
+            # Truncate to 40 chars if needed
+            if len(title) > 40:
+                title = title[:37] + "..."
+            
+            return title
+        except Exception as e:
+            logger.error(f"Failed to generate conversation title: {e}")
+            return ""
 
     def _log_query(self, question: str, user_id: str):
         """Log the query for analytics."""
