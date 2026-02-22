@@ -133,7 +133,15 @@ class QAService:
                 params["filter_document_ids"] = document_ids
 
             result = self.admin.rpc("match_chunks", params).execute()
-            return result.data or []
+            candidates = result.data or []
+            
+            if candidates:
+                top_sim = candidates[0].get("similarity", 0)
+                logger.info(f"Vector search: found {len(candidates)} candidates. Top similarity: {top_sim:.4f}")
+            else:
+                logger.info("Vector search: no candidates found.")
+                
+            return candidates
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
             return []
@@ -180,8 +188,10 @@ Return ONLY valid JSON array, no other text:
             raw = response.choices[0].message.content
             parsed = json.loads(raw)
 
-            # Handle both {"results": [...]} and [...] formats
-            rankings = parsed if isinstance(parsed, list) else parsed.get("results", parsed.get("chunks", []))
+            # Handle both {"results": [...]}, {"result": [...]}, and [...] formats
+            rankings = parsed if isinstance(parsed, list) else parsed.get("results", parsed.get("result", parsed.get("chunks", [])))
+            
+            logger.info(f"LLM Re-ranking: scored {len(rankings)} chunks.")
 
             # Enrich candidates with relevance scores
             score_map = {}
@@ -222,7 +232,7 @@ Return ONLY valid JSON array, no other text:
     # ── Answer Generation ──────────────────────────────────────────
 
     def _generate_answer(
-        self, question: str, chunks: List[dict]
+        self, question: str, chunks: List[dict], history: List[dict] = []
     ) -> tuple[str, List[SourceCitation]]:
         """Generate an answer using the re-ranked chunks as context."""
         if not chunks:
@@ -256,6 +266,7 @@ Provide a comprehensive answer with source citations [1], [2], etc."""
             model=self.settings.chat_model,
             messages=[
                 {"role": "system", "content": system_prompt},
+                *history,
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,
@@ -341,10 +352,17 @@ RULES:
         conv_id = await self._get_or_create_conversation(user_id, conversation_id, question)
         user_msg_id = await self._save_message(conv_id, "user", question)
 
-        # Fast path: skip RAG for clearly general queries
-        if not document_ids and self._is_general_query(question):
+        history = []
+        if conv_id:
+            raw_history = await self.get_messages(str(conv_id), user_id)
+            # Take last 10 messages and format for OpenAI
+            for msg in raw_history[-10:]:
+                history.append({"role": msg.role, "content": msg.content})
+
+        # --- GREETING FAST PATH (Moved before caching/embedding) ---
+        if self._is_general_query(question):
             full_answer = ""
-            async for event in self._stream_llm(question, self._GENERAL_SYSTEM_PROMPT):
+            async for event in self._stream_llm(question, self._GENERAL_SYSTEM_PROMPT, history=history):
                 yield event
                 if event.startswith("event: token\n"):
                     data_line = event.split("data: ", 1)[1].split("\n")[0]
@@ -356,7 +374,7 @@ RULES:
             )
             yield f"event: sources\ndata: []\n\n"
             
-            # Save and yield metadata
+            # Save message (Note: We do NOT cache general queries)
             assistant_msg_id = await self._save_message(
                 conv_id, "assistant", full_answer, [], metadata.model_dump()
             )
@@ -410,7 +428,7 @@ RULES:
         if not candidates:
             # General chat — stream directly
             full_answer = ""
-            async for event in self._stream_llm(question, self._GENERAL_SYSTEM_PROMPT):
+            async for event in self._stream_llm(question, self._GENERAL_SYSTEM_PROMPT, history=history):
                 yield event
                 if event.startswith("event: token\n"):
                     data_line = event.split("data: ", 1)[1].split("\n")[0]
@@ -440,7 +458,7 @@ RULES:
         if not reranked:
             # Re-ranking filtered everything — fall back to general chat
             full_answer = ""
-            async for event in self._stream_llm(question, self._GENERAL_SYSTEM_PROMPT):
+            async for event in self._stream_llm(question, self._GENERAL_SYSTEM_PROMPT, history=history):
                 yield event
                 if event.startswith("event: token\n"):
                     data_line = event.split("data: ", 1)[1].split("\n")[0]
@@ -474,7 +492,7 @@ RULES:
         user_prompt = f"CONTEXT:\n{context}\n\nQUESTION: {question}\n\nProvide a comprehensive answer with source citations [1], [2], etc."
 
         full_answer = ""
-        async for event in self._stream_llm(user_prompt, self._RAG_SYSTEM_PROMPT, temperature=0.1):
+        async for event in self._stream_llm(user_prompt, self._RAG_SYSTEM_PROMPT, temperature=0.1, history=history):
             yield event
             # Extract the token text from the event to accumulate the full answer
             if event.startswith("event: token\n"):
@@ -522,7 +540,7 @@ RULES:
         yield f"event: metadata\ndata: {json.dumps(meta_json)}\n\n"
         yield "event: done\ndata: {}\n\n"
 
-        # Update semantic cache
+        # Update semantic cache (ONLY for RAG results)
         try:
             response = AskResponse(
                 answer=full_answer,
@@ -531,7 +549,8 @@ RULES:
                 conversation_id=conv_id,
                 message_id=assistant_msg_id
             )
-            self._cache_response(question, query_embedding, user_id, document_ids, response)
+            if sources: # Extra guard to ensure we only cache if sources were found
+                self._cache_response(question, query_embedding, user_id, document_ids, response)
         except Exception as e:
             logger.warning(f"Post-stream history/cache failed: {e}")
 
@@ -548,7 +567,8 @@ RULES:
             "hi", "hello", "hey", "how are you", "who are you", 
             "what can you do", "help", "thanks", "thank you",
             "tell me a joke", "joke", "weather", "good morning",
-            "good afternoon", "good evening"
+            "good afternoon", "good evening", "how's it going",
+            "goodbye", "bye"
         }
         
         # Check if query starts with or is a general greeting
@@ -558,7 +578,7 @@ RULES:
         return False
 
     async def _stream_llm(
-        self, user_content: str, system_prompt: str, temperature: float = 0.7
+        self, user_content: str, system_prompt: str, temperature: float = 0.7, history: List[dict] = []
     ) -> AsyncIterator[str]:
         """Stream OpenAI completion token-by-token as SSE events."""
         try:
@@ -566,6 +586,7 @@ RULES:
                 model=self.settings.chat_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
+                    *history,
                     {"role": "user", "content": user_content},
                 ],
                 temperature=temperature,
@@ -619,7 +640,7 @@ RULES:
                     "question": question,
                     "question_embedding": embedding,
                     "document_ids": document_ids,
-                    "response": response.model_dump(),
+                    "response": response.model_dump(mode='json'),
                     "hit_count": 0,
                 }
             ).execute()

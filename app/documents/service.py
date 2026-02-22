@@ -8,8 +8,10 @@ from app.config import get_settings
 from app.documents.parsers import parse_document, SUPPORTED_EXTENSIONS
 from app.documents.schemas import ParsedElement
 from app.chunking.semantic import SemanticChunker
+from app.chunking.llm_chunker import LLMChunker
 from app.chunking.schemas import Chunk
 from app.embeddings.service import EmbeddingService
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +26,12 @@ class DocumentService:
         supabase_client: Client,
         admin_client: Client,
         embedding_service: EmbeddingService,
+        openai_client: OpenAI,
     ):
         self.client = supabase_client
         self.admin = admin_client
         self.embedding_service = embedding_service
+        self.openai = openai_client
         self.settings = get_settings()
 
     # ── Upload ─────────────────────────────────────────────────────
@@ -69,13 +73,16 @@ class DocumentService:
 
     # ── Background Processing ──────────────────────────────────────
 
-    async def process_document(self, document_id: str, user_id: str):
+    def process_document(self, document_id: str, user_id: str):
         """
         Background task: parse, chunk, embed, and index a document.
         Updates status and progress throughout.
         """
         try:
             # Update status to processing
+            if not self._document_exists(document_id):
+                logger.info(f"Document {document_id} no longer exists. Aborting.")
+                return
             self._update_status(document_id, "processing", 0)
 
             # 1. Download file from storage
@@ -86,6 +93,8 @@ class DocumentService:
             self._update_status(document_id, "processing", 10)
 
             # 2. Parse document
+            if not self._document_exists(document_id):
+                return
             logger.info(f"Parsing document: {doc['file_name']}")
             elements = parse_document(file_bytes, doc["file_name"])
             if not elements:
@@ -93,24 +102,69 @@ class DocumentService:
                 return
             self._update_status(document_id, "processing", 30)
 
-            # 3. Semantic chunking
-            logger.info(f"Chunking {len(elements)} elements semantically")
-            chunker = SemanticChunker(self.embedding_service)
-            chunks = chunker.chunk(elements)
+            # 3. Choose chunker (default to semantic, but ready for LLM)
+            if not self._document_exists(document_id):
+                return
+            # You can toggle this via settings or document metadata in future
+            use_llm_chunking = getattr(self.settings, "use_llm_chunking", False)
+            
+            if use_llm_chunking:
+                chunker = LLMChunker(self.openai, self.embedding_service)
+                def chunk_progress(p):
+                    self._update_status(document_id, "processing", 30 + int(p * 0.2))
+                chunks = chunker.chunk(elements, on_progress=chunk_progress)
+            else:
+                chunker = SemanticChunker(self.embedding_service)
+                chunks = chunker.chunk(elements)
+
             if not chunks:
                 self._update_status(document_id, "ready", 100, total_chunks=0)
                 return
             self._update_status(document_id, "processing", 50)
 
-            # 4. Generate final embeddings for chunks
+            # 4. Embed chunks
+            if not self._document_exists(document_id):
+                return
             logger.info(f"Embedding {len(chunks)} chunks")
-            chunk_texts = [c.content for c in chunks]
-            embeddings = self.embedding_service.embed_texts(chunk_texts)
-            self._update_status(document_id, "processing", 70)
+            texts = [c.content for c in chunks]
+            
+            def embed_progress(p):
+                self._update_status(document_id, "processing", 50 + int(p * 0.3))
+            
+            embeddings = self.embedding_service.embed_texts(texts, on_progress=embed_progress)
+            self._update_status(document_id, "processing", 80)
 
-            # 5. Store chunks in database
-            logger.info(f"Storing {len(chunks)} chunks in database")
-            self._store_chunks(document_id, user_id, chunks, embeddings)
+            # 5. Store in vector DB
+            if not self._document_exists(document_id):
+                return
+            logger.info(f"Indexing {len(chunks)} chunks")
+            BATCH_SIZE = 50
+            for i in range(0, len(chunks), BATCH_SIZE):
+                batch_chunks = chunks[i : i + BATCH_SIZE]
+                batch_embeddings = embeddings[i : i + BATCH_SIZE]
+
+                # ... (rest of the logic remains same, but I'll add progress update)
+                progress = 80 + int((i / len(chunks)) * 15)
+                self._update_status(document_id, "processing", progress)
+                
+                rows = []
+                for chunk, embedding in zip(batch_chunks, batch_embeddings):
+                    if i % 100 == 0 and not self._document_exists(document_id):
+                        logger.info(f"Document {document_id} deleted during indexing. stopping.")
+                        return
+                    rows.append(
+                        {
+                            "document_id": document_id,
+                            "user_id": user_id,
+                            "content": chunk.content,
+                            "page_number": chunk.page_number,
+                            "chunk_index": chunk.chunk_index,
+                            "embedding": embedding,
+                            "metadata": chunk.metadata,
+                        }
+                    )
+                self.admin.table("chunks").insert(rows).execute()
+
             self._update_status(
                 document_id, "ready", 100, total_chunks=len(chunks)
             )
@@ -170,6 +224,11 @@ class DocumentService:
         self.admin.table("documents").update(update_data).eq(
             "id", document_id
         ).execute()
+
+    def _document_exists(self, document_id: str) -> bool:
+        """Check if a document still exists in the database."""
+        result = self.admin.table("documents").select("id").eq("id", document_id).execute()
+        return len(result.data) > 0
 
     def _get_document(self, document_id: str) -> dict:
         """Get a document by ID."""

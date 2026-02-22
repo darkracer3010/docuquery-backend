@@ -34,8 +34,8 @@ class SemanticChunker:
         if not elements:
             return []
 
-        # Filter out very short elements
-        valid_elements = [e for e in elements if len(e.text.strip()) > 10]
+        # Filter out very short elements (relaxed from 10 to 3 to preserve headers)
+        valid_elements = [e for e in elements if len(e.text.strip()) > 3]
         if not valid_elements:
             return []
 

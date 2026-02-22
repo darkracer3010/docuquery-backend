@@ -11,10 +11,16 @@ router = APIRouter()
 
 
 def _get_document_service() -> DocumentService:
+    supabase = get_supabase_client()
+    admin = get_supabase_admin_client()
+    openai = get_openai_client()
+    embedding = EmbeddingService(openai)
+    
     return DocumentService(
-        supabase_client=get_supabase_client(),
-        admin_client=get_supabase_admin_client(),
-        embedding_service=EmbeddingService(get_openai_client()),
+        supabase,
+        admin,
+        embedding,
+        openai
     )
 
 

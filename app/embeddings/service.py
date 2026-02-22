@@ -29,7 +29,7 @@ class EmbeddingService:
             return text
         return self._tokenizer.decode(tokens[:max_tokens])
 
-    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+    def embed_texts(self, texts: List[str], on_progress: callable = None) -> List[List[float]]:
         """
         Generate embeddings for a list of texts.
         Handles batching and token truncation automatically.
@@ -51,6 +51,10 @@ class EmbeddingService:
             )
             batch_embeddings = [item.embedding for item in response.data]
             all_embeddings.extend(batch_embeddings)
+            
+            if on_progress:
+                progress = int(((i + len(batch)) / len(safe_texts)) * 100)
+                on_progress(progress)
 
         return all_embeddings
 

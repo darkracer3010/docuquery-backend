@@ -111,8 +111,10 @@ async def delete_conversation(
     user_id: str = Depends(get_current_user),
 ):
     """Delete a conversation."""
+    print(f"!!! RECEIVED DELETE REQUEST FOR CONVO {conversation_id} from user {user_id} !!!")
     service = _get_qa_service()
     success = await service.delete_conversation(conversation_id, user_id)
+    print(f"!!! DELETE RESULT: {success} !!!")
     if not success:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

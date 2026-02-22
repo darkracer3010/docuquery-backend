@@ -37,7 +37,8 @@ class PDFParser(BaseParser):
                 block_text = " ".join(block_text_parts)
                 cleaned = self._clean_text(block_text)
 
-                if not cleaned or len(cleaned) < 3:
+                # Skip blocks that are purely punctuation (layout noise) or too small
+                if not cleaned or len(cleaned) < 3 or not any(c.isalnum() for c in cleaned):
                     continue
 
                 elements.append(
